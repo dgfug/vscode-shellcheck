@@ -184,7 +184,7 @@
     "execa": "^5.0.0",
     "lodash": "^4.17.19",
     "minimatch": "^3.0.4",
-    "semver": "^7.3.4"
+    "semver": "^7.3.7"
   },
   "devDependencies": {
     "@semantic-release/changelog": "^5.0.1",
