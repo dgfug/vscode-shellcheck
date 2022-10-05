@@ -184,7 +184,7 @@
     "execa": "^5.0.0",
     "lodash": "^4.17.19",
     "minimatch": "^3.0.4",
-    "semver": "^7.3.4"
+    "semver": "^7.3.8"
   },
   "devDependencies": {
     "@semantic-release/changelog": "^5.0.1",
@@ -194,7 +194,7 @@
     "@types/minimatch": "^3.0.3",
     "@types/mocha": "^9.0.0",
     "@types/node": "^10.11.0",
-    "@types/semver": "^7.3.4",
+    "@types/semver": "^7.3.12",
     "@types/vscode": "~1.38.0",
     "@typescript-eslint/eslint-plugin": "^4.31.0",
     "@typescript-eslint/parser": "^4.31.0",
