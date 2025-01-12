@@ -1,117 +1,90 @@
-import * as fs from "fs";
-import * as path from "path";
+import * as path from "node:path";
 import * as semver from "semver";
 import * as vscode from "vscode";
-import * as execa from "execa";
+import execa from "execa";
+import { ShellCheckExtensionApi } from "./api";
 import { createParser, ParseResult } from "./parser";
 import { ThrottledDelayer } from "./utils/async";
-import { FileMatcher, FileSettings } from "./utils/filematcher";
 import { getToolVersion, tryPromptForUpdatingTool } from "./utils/tool-check";
-import { getWorkspaceFolderPath } from "./utils/path";
+import {
+  guessDocumentDirname,
+  getWorkspaceFolderPath,
+  ensureCurrentWorkingDirectory,
+} from "./utils/path";
 import { FixAllProvider } from "./fix-all";
-
-interface Executable {
-  path: string;
-  bundled: boolean;
-}
-
-interface ShellCheckSettings {
-  enabled: boolean;
-  enableQuickFix: boolean;
-  executable: Executable;
-  trigger: RunTrigger;
-  exclude: string[];
-  customArgs: string[];
-  ignorePatterns: FileSettings;
-  ignoreFileSchemes: Set<string>;
-  useWorkspaceRootAsCwd: boolean;
-}
-
-enum RunTrigger {
-  onSave,
-  onType,
-  manual,
-}
-
-namespace RunTrigger {
-  export const strings = {
-    onSave: "onSave",
-    onType: "onType",
-    manual: "manual",
-  };
-
-  export function from(value: string): RunTrigger {
-    switch (value) {
-      case strings.onSave:
-        return RunTrigger.onSave;
-      case strings.onType:
-        return RunTrigger.onType;
-      default:
-        return RunTrigger.manual;
-    }
-  }
-}
+import { getWikiUrlForRule } from "./utils/link";
+import * as logging from "./utils/logging";
+import {
+  checkIfConfigurationChanged,
+  getWorkspaceSettings,
+  RunTrigger,
+  ShellCheckSettings,
+} from "./settings";
 
 namespace CommandIds {
   export const runLint: string = "shellcheck.runLint";
+  export const disableCheckForLine: string = "shellcheck.disableCheckForLine";
   export const openRuleDoc: string = "shellcheck.openRuleDoc";
+  export const collectDiagnostics: string = "shellcheck.collectDiagnostics";
 }
 
-function substitutePath(s: string, workspaceFolder?: string): string {
-  if (!workspaceFolder && vscode.workspace.workspaceFolders) {
-    workspaceFolder = getWorkspaceFolderPath(
-      vscode.window.activeTextEditor &&
-        vscode.window.activeTextEditor.document.uri
-    );
+type ToolStatus =
+  | { ok: true; version: semver.SemVer }
+  | { ok: false; reason: "executableNotFound" | "executionFailed" };
+
+function toolStatusByError(error: any): ToolStatus {
+  if (error && error instanceof Error) {
+    const e = error as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") {
+      return { ok: false, reason: "executableNotFound" };
+    }
   }
 
-  return s.replace(/\${workspaceRoot}/g, workspaceFolder || "");
+  return { ok: false, reason: "executionFailed" };
 }
 
 export default class ShellCheckProvider implements vscode.CodeActionProvider {
-  public static LANGUAGE_ID = "shellscript";
-  private channel: vscode.OutputChannel;
-  private settings!: ShellCheckSettings;
-  private executableNotFound: boolean;
-  private toolVersion: semver.SemVer | null;
-  private documentListener!: vscode.Disposable;
-  private delayers!: { [key: string]: ThrottledDelayer<void> };
-  private readonly fileMatcher: FileMatcher;
-  private readonly diagnosticCollection: vscode.DiagnosticCollection;
-  private readonly codeActionCollection: Map<string, ParseResult[]>;
+  public static readonly LANGUAGE_ID = "shellscript";
 
   public static readonly providedCodeActionKinds = [
     vscode.CodeActionKind.QuickFix,
     vscode.CodeActionKind.Source,
   ];
 
-  public static metadata: vscode.CodeActionProviderMetadata = {
+  public static readonly metadata: vscode.CodeActionProviderMetadata = {
     providedCodeActionKinds: ShellCheckProvider.providedCodeActionKinds,
   };
 
+  private delayers: { [key: string]: ThrottledDelayer<void> };
+  private readonly settingsByUri: Map<string, ShellCheckSettings>;
+  private readonly toolStatusByPath: Map<string, ToolStatus>;
+  private readonly diagnosticCollection: vscode.DiagnosticCollection;
+  private readonly codeActionCollection: Map<string, ParseResult[]>;
+  private readonly additionalDocumentFilters: Set<vscode.DocumentFilter>;
+
   constructor(private readonly context: vscode.ExtensionContext) {
-    this.channel = vscode.window.createOutputChannel("ShellCheck");
-    this.executableNotFound = false;
-    this.toolVersion = null;
-    this.fileMatcher = new FileMatcher();
-    this.diagnosticCollection = vscode.languages.createDiagnosticCollection();
+    this.delayers = Object.create(null);
+    this.settingsByUri = new Map();
+    this.toolStatusByPath = new Map();
+    this.diagnosticCollection =
+      vscode.languages.createDiagnosticCollection("shellcheck");
     this.codeActionCollection = new Map();
+    this.additionalDocumentFilters = new Set();
 
     // code actions
     context.subscriptions.push(
       vscode.languages.registerCodeActionsProvider(
-        "shellscript",
+        ShellCheckProvider.LANGUAGE_ID,
         this,
-        ShellCheckProvider.metadata
-      )
+        ShellCheckProvider.metadata,
+      ),
     );
-
     context.subscriptions.push(
       vscode.languages.registerCodeActionsProvider(
-        "shellscript",
+        ShellCheckProvider.LANGUAGE_ID,
         new FixAllProvider(),
-        FixAllProvider.metadata
-      )
+        FixAllProvider.metadata,
+      ),
     );
 
     // commands
@@ -121,160 +94,189 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
         async (url: string) => {
           return await vscode.commands.executeCommand(
             "vscode.open",
-            vscode.Uri.parse(url)
+            vscode.Uri.parse(url),
           );
-        }
+        },
+      ),
+      vscode.commands.registerCommand(
+        CommandIds.disableCheckForLine,
+        async (
+          document: vscode.TextDocument,
+          ruleId: string,
+          range: vscode.Range,
+        ) => {
+          return await this.disableCheckForLine(document, ruleId, range);
+        },
       ),
       vscode.commands.registerTextEditorCommand(
         CommandIds.runLint,
         async (editor) => {
           return await this.triggerLint(editor.document);
-        }
-      )
+        },
+      ),
+      vscode.commands.registerTextEditorCommand(
+        CommandIds.collectDiagnostics,
+        async (editor) => {
+          return await this.collectDiagnostics(editor.document);
+        },
+      ),
     );
 
     // event handlers
     vscode.workspace.onDidChangeConfiguration(
-      this.loadConfiguration,
+      this.onDidChangeConfiguration,
       this,
-      context.subscriptions
+      context.subscriptions,
     );
     vscode.workspace.onDidOpenTextDocument(
-      this.triggerLint,
+      this.onDidOpenTextDocument,
       this,
-      context.subscriptions
+      context.subscriptions,
     );
     vscode.workspace.onDidCloseTextDocument(
-      (textDocument) => {
-        this.setCollection(textDocument.uri);
-        delete this.delayers[textDocument.uri.toString()];
-      },
-      null,
-      context.subscriptions
+      this.onDidCloseTextDocument,
+      this,
+      context.subscriptions,
+    );
+    vscode.workspace.onDidChangeTextDocument(
+      this.onDidChangeTextDocument,
+      this,
+      context.subscriptions,
+    );
+    vscode.workspace.onDidSaveTextDocument(
+      this.onDidSaveTextDocument,
+      this,
+      context.subscriptions,
     );
 
-    // populate this.settings
-    this.loadConfiguration().then(() => {
-      // Shellcheck all open shell documents
-      vscode.workspace.textDocuments.forEach(this.triggerLint, this);
-    });
+    // Shellcheck all open shell documents
+    this.triggerLintForEntireWorkspace();
+  }
+
+  private onDidCloseTextDocument(textDocument: vscode.TextDocument) {
+    this.setResultCollections(textDocument.uri);
+    this.settingsByUri.delete(textDocument.uri.toString());
+    delete this.delayers[textDocument.uri.toString()];
+  }
+
+  private onDidChangeConfiguration(e: vscode.ConfigurationChangeEvent) {
+    if (!checkIfConfigurationChanged(e)) {
+      return;
+    }
+
+    this.settingsByUri.clear();
+    this.toolStatusByPath.clear();
+
+    // Shellcheck all open shell documents
+    this.triggerLintForEntireWorkspace();
+  }
+
+  private async onDidOpenTextDocument(textDocument: vscode.TextDocument) {
+    try {
+      await this.triggerLint(textDocument);
+    } catch (error) {
+      logging.error(`onDidOpenTextDocument: ${error}`);
+    }
+  }
+
+  private async onDidChangeTextDocument(
+    textDocumentChangeEvent: vscode.TextDocumentChangeEvent,
+  ) {
+    if (textDocumentChangeEvent.document.uri.scheme === "output") {
+      /*
+       * Special case: silently drop any event that comes from
+       * an output channel. This avoids an endless feedback loop,
+       * which would occur if this handler were to log something
+       * to our own channel.
+       * Output channels cannot be shell scripts anyway.
+       */
+      return;
+    }
+    try {
+      await this.triggerLint(
+        textDocumentChangeEvent.document,
+        (settings) => settings.trigger === RunTrigger.onType,
+      );
+    } catch (error) {
+      logging.error(`onDidChangeTextDocument: ${error}`);
+    }
+  }
+
+  private async onDidSaveTextDocument(textDocument: vscode.TextDocument) {
+    try {
+      await this.triggerLint(
+        textDocument,
+        (settings) => settings.trigger === RunTrigger.onSave,
+      );
+    } catch (error) {
+      logging.error(`onDidSaveTextDocument ${error}`);
+    }
+  }
+
+  private async triggerLintForEntireWorkspace() {
+    for await (const textDocument of vscode.workspace.textDocuments) {
+      try {
+        await this.triggerLint(textDocument);
+      } catch (error) {
+        logging.error(`triggerLintForEntireWorkspace: ${error}`);
+      }
+    }
   }
 
   public dispose(): void {
-    this.disposeDocumentListener();
-    this.diagnosticCollection.clear();
     this.codeActionCollection.clear();
     this.diagnosticCollection.dispose();
-    this.channel.dispose();
   }
 
-  private disposeDocumentListener(): void {
-    if (this.documentListener) {
-      this.documentListener.dispose();
+  private async getSettings(
+    textDocument: vscode.TextDocument,
+  ): Promise<ShellCheckSettings> {
+    if (!this.settingsByUri.has(textDocument.uri.toString())) {
+      await this.updateConfiguration(textDocument);
     }
+    return this.settingsByUri.get(textDocument.uri.toString())!;
   }
 
-  private getExecutable(executablePath: string): Executable {
-    let isBundled = false;
-    if (executablePath) {
-      executablePath = substitutePath(executablePath);
-    } else {
-      // Use bundled binaries (maybe)
-      let suffix = "";
-      let osarch = process.arch;
-      if (process.platform === "win32") {
-        if (process.arch === "x64" || process.arch === "ia32") {
-          osarch = "x32";
-        }
-        suffix = ".exe";
-      }
-      executablePath = this.context.asAbsolutePath(
-        `./binaries/${process.platform}/${osarch}/shellcheck${suffix}`
-      );
-      if (fs.existsSync(executablePath)) {
-        isBundled = true;
-      } else {
-        // Fallback to default shellcheck path
-        executablePath = "shellcheck";
-      }
-    }
+  private async updateConfiguration(textDocument: vscode.TextDocument) {
+    const settings = await getWorkspaceSettings(this.context, textDocument);
 
-    return {
-      path: executablePath,
-      bundled: isBundled,
-    };
-  }
+    this.settingsByUri.set(textDocument.uri.toString(), settings);
+    this.setResultCollections(textDocument.uri);
 
-  private async loadConfiguration() {
-    const section = vscode.workspace.getConfiguration("shellcheck", null);
-    const settings = <ShellCheckSettings>{
-      enabled: section.get("enable", true),
-      trigger: RunTrigger.from(section.get("run", RunTrigger.strings.onType)),
-      executable: this.getExecutable(section.get("executablePath", "")),
-      exclude: section.get("exclude", []),
-      customArgs: section.get("customArgs", []),
-      ignorePatterns: section.get("ignorePatterns", {}),
-      ignoreFileSchemes: new Set(
-        section.get("ignoreFileSchemes", ["git", "gitfs"])
-      ),
-      useWorkspaceRootAsCwd: section.get("useWorkspaceRootAsCwd", false),
-      enableQuickFix: section.get("enableQuickFix", false),
-    };
-    this.settings = settings;
-
-    this.fileMatcher.configure(settings.ignorePatterns);
-    this.delayers = Object.create(null);
-
-    this.disposeDocumentListener();
-    this.diagnosticCollection.clear();
-    this.codeActionCollection.clear();
-    if (settings.enabled) {
-      if (settings.trigger === RunTrigger.onType) {
-        this.documentListener = vscode.workspace.onDidChangeTextDocument(
-          (e) => {
-            this.triggerLint(e.document);
-          },
-          this,
-          this.context.subscriptions
-        );
-      } else if (settings.trigger === RunTrigger.onSave) {
-        this.documentListener = vscode.workspace.onDidSaveTextDocument(
-          this.triggerLint,
-          this,
-          this.context.subscriptions
-        );
-      }
-
+    if (
+      settings.enabled &&
+      !this.toolStatusByPath.has(settings.executable.path)
+    ) {
       // Prompt user to update shellcheck binary when necessary
+      let toolStatus: ToolStatus;
       try {
-        this.toolVersion = await getToolVersion(settings.executable.path);
-        this.executableNotFound = false;
+        toolStatus = {
+          ok: true,
+          version: await getToolVersion(settings.executable.path),
+        };
       } catch (error: any) {
+        logging.debug("Failed to get tool version: %O", error);
         this.showShellCheckError(error);
-        this.executableNotFound = true;
+        toolStatus = toolStatusByError(error);
       }
+      this.toolStatusByPath.set(settings.executable.path, toolStatus);
 
-      if (settings.executable.bundled) {
-        this.channel.appendLine(
-          `[INFO] shellcheck (bundled) version: ${this.toolVersion}`
-        );
-      } else {
-        this.channel.appendLine(
-          `[INFO] shellcheck version: ${this.toolVersion}`
-        );
-        tryPromptForUpdatingTool(this.toolVersion);
+      if (toolStatus.ok) {
+        if (settings.executable.bundled) {
+          logging.info(`shellcheck (bundled) version: ${toolStatus.version}`);
+        } else {
+          logging.info(`shellcheck version: ${toolStatus.version}`);
+          tryPromptForUpdatingTool(toolStatus.version);
+        }
       }
     }
-
-    // Configuration has changed. Re-evaluate all documents
-    vscode.workspace.textDocuments.forEach(this.triggerLint, this);
   }
 
   public provideCodeActions(
     document: vscode.TextDocument,
     range: vscode.Range | vscode.Selection,
     context: vscode.CodeActionContext,
-    token: vscode.CancellationToken
+    token: vscode.CancellationToken,
   ): vscode.ProviderResult<(vscode.Command | vscode.CodeAction)[]> {
     const actions: vscode.CodeAction[] = [];
 
@@ -284,19 +286,45 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
       }
 
       if (
-        typeof diagnostic.code === "string" &&
-        diagnostic.code.startsWith("SC")
+        typeof diagnostic.code === "object" &&
+        typeof diagnostic.code.value === "string" &&
+        diagnostic.code.value.startsWith("SC")
       ) {
-        const ruleId = diagnostic.code;
-        const title = `Show ShellCheck Wiki for ${ruleId}`;
+        const ruleId = diagnostic.code.value;
+        const title = `ShellCheck: Show wiki for ${ruleId}`;
         const action = new vscode.CodeAction(
           title,
-          vscode.CodeActionKind.QuickFix
+          vscode.CodeActionKind.QuickFix,
         );
         action.command = {
-          title: title,
+          title,
           command: CommandIds.openRuleDoc,
-          arguments: [`https://www.shellcheck.net/wiki/${ruleId}`],
+          arguments: [getWikiUrlForRule(ruleId)],
+        };
+        actions.push(action);
+      }
+    }
+
+    for (const diagnostic of context.diagnostics) {
+      if (diagnostic.source !== "shellcheck") {
+        continue;
+      }
+
+      if (
+        typeof diagnostic.code === "object" &&
+        typeof diagnostic.code.value === "string" &&
+        diagnostic.code.value.startsWith("SC")
+      ) {
+        const ruleId = diagnostic.code.value;
+        const title = `ShellCheck: Disable ${ruleId} for this line`;
+        const action = new vscode.CodeAction(
+          title,
+          vscode.CodeActionKind.QuickFix,
+        );
+        action.command = {
+          title,
+          command: CommandIds.disableCheckForLine,
+          arguments: [document, ruleId, diagnostic.range],
         };
         actions.push(action);
       }
@@ -320,29 +348,159 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
     return actions;
   }
 
-  private isAllowedTextDocument(textDocument: vscode.TextDocument): boolean {
-    if (textDocument.languageId !== ShellCheckProvider.LANGUAGE_ID) {
-      return false;
-    }
-
-    const scheme = textDocument.uri.scheme;
-    return !this.settings.ignoreFileSchemes.has(scheme);
+  public provideApi(): ShellCheckExtensionApi {
+    return {
+      apiVersion1: {
+        registerDocumentFilter: this.registerDocumentFilter,
+      },
+    };
   }
 
-  private triggerLint(textDocument: vscode.TextDocument): void {
-    if (this.executableNotFound || !this.isAllowedTextDocument(textDocument)) {
+  private registerDocumentFilter = (documentFilter: vscode.DocumentFilter) => {
+    if (this.additionalDocumentFilters.has(documentFilter)) {
+      // Duplicate request. Ignore.
+      return vscode.Disposable.from();
+    }
+    this.additionalDocumentFilters.add(documentFilter);
+    // A new language ID may provide new configuration defaults
+    this.settingsByUri.clear();
+    this.toolStatusByPath.clear();
+    // Re-evaluate all open shell documents due to updated filters
+    this.triggerLintForEntireWorkspace();
+
+    return {
+      dispose: () => {
+        this.additionalDocumentFilters.delete(documentFilter);
+        // Reset configuration defaults
+        this.settingsByUri.clear();
+        this.toolStatusByPath.clear();
+      },
+    };
+  };
+
+  private isAllowedTextDocument(textDocument: vscode.TextDocument): boolean {
+    const allowedDocumentSelector: vscode.DocumentSelector = [
+      ShellCheckProvider.LANGUAGE_ID,
+      ...this.additionalDocumentFilters,
+    ];
+    return !!vscode.languages.match(allowedDocumentSelector, textDocument);
+  }
+
+  private async collectDiagnostics(textDocument: vscode.TextDocument) {
+    const output: string[] = [
+      "## Document\n",
+      `URI: \`${textDocument.uri.toString()}\``,
+      `Language: \`${textDocument.languageId}\``,
+      "",
+    ];
+
+    output.push("## ShellCheck\n");
+    const settings: ShellCheckSettings = await this.getSettings(textDocument);
+    const toolStatus = this.toolStatusByPath.get(settings.executable.path);
+    if (toolStatus && toolStatus.ok) {
+      output.push(
+        `- Version: \`${toolStatus.version}\``,
+        `- Bundled: \`${settings.executable.bundled}\``,
+        "",
+      );
+    } else {
+      output.push("- ShellCheck is not installed or not working");
+      output.push("");
+    }
+
+    const warnings: string[] = [];
+    if (!this.isAllowedTextDocument(textDocument)) {
+      warnings.push("- Document is not a shell script or is filtered out");
+    }
+
+    if (settings.ignoreFileSchemes.has(textDocument.uri.scheme)) {
+      warnings.push(
+        `- File scheme of document is ignored: ${textDocument.uri.scheme} not in \`shellcheck.ignoreFileSchemes\``,
+      );
+    }
+
+    if (warnings.length) {
+      output.push("## Warnings\n");
+      output.push(...warnings);
+      output.push("");
+    }
+    const ext = vscode.extensions.getExtension("mads-hartmann.bash-ide-vscode");
+    if (ext) {
+      const bashIdeSection = vscode.workspace.getConfiguration(
+        "bashIde",
+        textDocument,
+      );
+      if (bashIdeSection.get<boolean>("enableSourceErrorDiagnostics")) {
+        output.push(
+          "## Notes about Bash IDE Extension\n",
+          "- This extension may overlaps the Bash IDE extension, to disable linting in Bash IDE, you can set `bashIde.enableSourceErrorDiagnostics` to `false`.",
+        );
+      }
+    }
+
+    output.push("");
+
+    const doc = await vscode.workspace.openTextDocument({
+      language: "markdown",
+      content: output.join("\n"),
+    });
+    await vscode.window.showTextDocument(doc, { preview: true });
+  }
+
+  private async disableCheckForLine(
+    textDocument: vscode.TextDocument,
+    ruleId: string,
+    range: vscode.Range,
+  ) {
+    if (!this.isAllowedTextDocument(textDocument)) {
+      return;
+    }
+    const targetLine = textDocument.lineAt(range.start.line);
+    const indent = targetLine.text.substring(
+      0,
+      targetLine.firstNonWhitespaceCharacterIndex,
+    );
+
+    const textEdit = vscode.TextEdit.insert(
+      new vscode.Position(
+        range.start.line,
+        targetLine.firstNonWhitespaceCharacterIndex,
+      ),
+      `# shellcheck disable=${ruleId}\n${indent}`,
+    );
+
+    const edit = new vscode.WorkspaceEdit();
+    edit.set(textDocument.uri, [textEdit]);
+
+    vscode.workspace.applyEdit(edit);
+  }
+
+  private async triggerLint(
+    textDocument: vscode.TextDocument,
+    extraCondition: (settings: ShellCheckSettings) => boolean = (_) => true,
+  ) {
+    if (!this.isAllowedTextDocument(textDocument)) {
       return;
     }
 
-    if (!this.settings.enabled) {
-      this.setCollection(textDocument.uri);
+    const settings: ShellCheckSettings = await this.getSettings(textDocument);
+    if (
+      !extraCondition(settings) ||
+      !this.toolStatusByPath.get(settings.executable.path)!.ok ||
+      settings.ignoreFileSchemes.has(textDocument.uri.scheme)
+    ) {
+      return;
+    }
+
+    if (!settings.enabled) {
+      this.setResultCollections(textDocument.uri);
       return;
     }
 
     if (
-      this.fileMatcher.excludes(
+      settings.fileMatcher.excludes(
         textDocument.fileName,
-        getWorkspaceFolderPath(textDocument.uri)
+        getWorkspaceFolderPath(textDocument.uri, false),
       )
     ) {
       return;
@@ -352,22 +510,29 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
     let delayer = this.delayers[key];
     if (!delayer) {
       delayer = new ThrottledDelayer<void>(
-        this.settings.trigger === RunTrigger.onType ? 250 : 0
+        settings.trigger === RunTrigger.onType ? 250 : 0,
       );
       this.delayers[key] = delayer;
     }
 
-    delayer.trigger(() => this.runLint(textDocument));
+    delayer.trigger(() => this.runLint(textDocument, settings));
   }
 
-  private runLint(textDocument: vscode.TextDocument): Promise<void> {
+  private runLint(
+    textDocument: vscode.TextDocument,
+    settings: ShellCheckSettings,
+  ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const settings = this.settings;
-
-      const executable = settings.executable || "shellcheck";
+      const toolStatus: ToolStatus = this.toolStatusByPath.get(
+        settings.executable.path,
+      )!;
+      if (!toolStatus.ok) {
+        return reject(toolStatus.reason);
+      }
+      const executable = settings.executable;
       const parser = createParser(textDocument, {
-        toolVersion: this.toolVersion,
-        enableQuickFix: this.settings.enableQuickFix,
+        toolVersion: toolStatus.version,
+        enableQuickFix: settings.enableQuickFix,
       });
       let args = ["-f", parser.outputFormat];
       if (settings.exclude.length) {
@@ -379,7 +544,7 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
       const fileExt = path.extname(textDocument.fileName);
       if (fileExt === ".bash" || fileExt === ".ksh" || fileExt === ".dash") {
         // shellcheck args: specify dialect (sh, bash, dash, ksh)
-        args = args.concat(["-s", fileExt.substr(1)]);
+        args = args.concat(["-s", fileExt.substring(1)]);
       }
 
       if (settings.customArgs.length) {
@@ -392,52 +557,68 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
       if (settings.useWorkspaceRootAsCwd) {
         cwd = getWorkspaceFolderPath(textDocument.uri);
       } else {
-        cwd = textDocument.isUntitled
-          ? getWorkspaceFolderPath(textDocument.uri)
-          : path.dirname(textDocument.fileName);
+        cwd = guessDocumentDirname(textDocument);
       }
 
-      const options = cwd ? { cwd: cwd } : undefined;
-      // this.channel.appendLine(`[DEBUG] Spawn: ${executable} ${args.join(' ')}`);
-      const childProcess = execa(executable.path, args, options);
-      childProcess.on("error", (error: NodeJS.ErrnoException) => {
-        if (!this.executableNotFound) {
-          this.showShellCheckError(error);
-        }
+      const handleError = (error: Error) => {
+        logging.debug("Unable to start shellcheck: %O", error);
+        this.showShellCheckError(error);
+        this.toolStatusByPath.set(executable.path, toolStatusByError(error));
+      };
 
-        this.executableNotFound = true;
-        resolve();
-        return;
-      });
+      ensureCurrentWorkingDirectory(cwd)
+        .then((resolvedCwd) => {
+          cwd = resolvedCwd;
+          logging.debug("Spawn: (cwd=%s) %s %s", cwd, executable.path, args);
+          const options: execa.Options = { cwd };
+          const childProcess = execa(executable.path, args, options);
 
-      if (childProcess.pid) {
-        childProcess.stdout.setEncoding("utf-8");
+          if (childProcess.pid && childProcess.stdin && childProcess.stdout) {
+            childProcess.stdout.setEncoding("utf-8");
 
-        let script = textDocument.getText();
-        childProcess.stdin.write(script);
-        childProcess.stdin.end();
+            const script = textDocument.getText();
+            childProcess.stdin.write(script);
+            childProcess.stdin.end();
 
-        const output: string[] = [];
-        childProcess.stdout
-          .on("data", (data: Buffer) => {
-            output.push(data.toString());
-          })
-          .on("end", () => {
-            let result: ParseResult[] | null = null;
-            if (output.length) {
-              result = parser.parse(output.join(""));
-            }
+            const buf: string[] = [];
 
-            this.setCollection(textDocument.uri, result);
+            childProcess.stdout
+              .on("data", (chunk: Buffer) => {
+                buf.push(chunk.toString());
+              })
+              .on("end", () => {
+                let result: ParseResult[] | null = null;
+                const output = buf.join("");
+                logging.trace("shellcheck response: %s", output);
+                if (output.length) {
+                  result = parser.parse(output);
+                }
+                this.setResultCollections(textDocument.uri, result);
+                resolve();
+              });
+
+            childProcess.on("error", (error) => {
+              handleError(error);
+              resolve();
+            });
+          } else {
+            childProcess.catch((error) => {
+              handleError(error);
+            });
             resolve();
-          });
-      } else {
-        resolve();
-      }
+          }
+        })
+        .catch((error) => {
+          handleError(error);
+          resolve();
+        });
     });
   }
 
-  private setCollection(uri: vscode.Uri, results?: ParseResult[] | null) {
+  private setResultCollections(
+    uri: vscode.Uri,
+    results?: ParseResult[] | null,
+  ) {
     if (!results || !results.length) {
       this.diagnosticCollection.delete(uri);
       this.codeActionCollection.delete(uri.toString());
@@ -449,22 +630,26 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
     this.codeActionCollection.set(uri.toString(), results);
   }
 
-  private async showShellCheckError(
-    error: NodeJS.ErrnoException
-  ): Promise<void> {
+  private async showShellCheckError(err: any): Promise<void> {
     let message: string;
     let items: string[] = [];
-    if (error.code === "ENOENT") {
-      message = `The shellcheck program was not found (not installed?). Use the 'shellcheck.executablePath' setting to configure the location of 'shellcheck'`;
-      items = ["OK", "Installation Guide"];
+
+    if (err && err instanceof Error) {
+      const error = err as NodeJS.ErrnoException;
+      if (error.code === "ENOENT") {
+        message = `The shellcheck program was not found (not installed?). Use the 'shellcheck.executablePath' setting to configure the location of 'shellcheck'`;
+        items = ["OK", "Installation Guide"];
+      } else {
+        message = `Failed to run shellcheck: [${error.code}] ${error.message}`;
+      }
     } else {
-      message = `Failed to run shellcheck: [${error.code}] ${error.message}`;
+      message = `Failed to run shellcheck: unknown error`;
     }
 
     const selected = await vscode.window.showErrorMessage(message, ...items);
     if (selected === "Installation Guide") {
       vscode.env.openExternal(
-        vscode.Uri.parse("https://github.com/koalaman/shellcheck#installing")
+        vscode.Uri.parse("https://github.com/koalaman/shellcheck#installing"),
       );
     }
   }

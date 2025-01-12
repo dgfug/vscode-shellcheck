@@ -4,46 +4,32 @@ function executeCodeActionProvider(uri: vscode.Uri, range: vscode.Range) {
   return vscode.commands.executeCommand<vscode.CodeAction[]>(
     "vscode.executeCodeActionProvider",
     uri,
-    range
+    range,
   );
 }
 
 async function getFixAllCodeAction(
-  document: vscode.TextDocument
+  document: vscode.TextDocument,
 ): Promise<vscode.CodeAction | undefined> {
-  const nonUniqueRanges = vscode.languages
+  const actionRanges = vscode.languages
     .getDiagnostics(document.uri)
     .filter((diagnostic) => diagnostic.source === "shellcheck")
     .map((diagnostic) => diagnostic.range);
 
-  // filter ranges so we get only unique ranges
-  const uniqueRanges: vscode.Range[] = [];
-  for (const nonUniqueRange of nonUniqueRanges) {
-    let duplicated = false;
-
-    for (const uniqueRange of uniqueRanges) {
-      if (uniqueRange.contains(nonUniqueRange)) {
-        duplicated = true;
-        break;
-      }
-    }
-
-    if (!duplicated) {
-      uniqueRanges.push(nonUniqueRange);
-    }
-  }
-
   const codeActions: vscode.CodeAction[] = [];
-  for (const range of uniqueRanges) {
+  for (const range of actionRanges) {
     const codeActionsForDiagnostic = await executeCodeActionProvider(
       document.uri,
-      range
+      range,
     );
 
     if (codeActionsForDiagnostic) {
-      // get only code actions which perform edits
+      // get only code actions from shellcheck which perform edits and isPreferred
       const actionToFix = codeActionsForDiagnostic.filter(
-        (action) => action.edit
+        (action) =>
+          action.title.startsWith("ShellCheck: ") &&
+          action.isPreferred &&
+          action.edit,
       );
       codeActions.push(...actionToFix);
     }
@@ -51,8 +37,8 @@ async function getFixAllCodeAction(
 
   if (codeActions.length > 0) {
     const fixAll = new vscode.CodeAction(
-      "Fix All ShellCheck",
-      FixAllProvider.fixAllCodeActionKind
+      "ShellCheck: Fix all auto-fixable issues",
+      FixAllProvider.fixAllCodeActionKind,
     );
 
     for (const action of codeActions) {
@@ -66,8 +52,28 @@ async function getFixAllCodeAction(
         if (!fixAll.edit) {
           fixAll.edit = new vscode.WorkspaceEdit();
         }
-        for (const edit of action.edit.entries()) {
-          fixAll.edit.set(edit[0], edit[1]);
+        for (const actionEditEntries of action.edit.entries()) {
+          // filter overlapping edits to prevent wrong behavior
+          let duplicated = false;
+          for (const actionEdit of actionEditEntries[1]) {
+            for (const fixAllEditEntries of fixAll.edit.entries()) {
+              for (const fixAllEdit of fixAllEditEntries[1]) {
+                if (fixAllEdit.range.contains(actionEdit.range)) {
+                  duplicated = true;
+                  break;
+                }
+              }
+              if (duplicated) {
+                break;
+              }
+            }
+            if (duplicated) {
+              break;
+            }
+          }
+          if (!duplicated) {
+            fixAll.edit.set(actionEditEntries[0], actionEditEntries[1]);
+          }
         }
       }
     }
@@ -89,7 +95,7 @@ export class FixAllProvider implements vscode.CodeActionProvider {
     document: vscode.TextDocument,
     _range: vscode.Range | vscode.Selection,
     context: vscode.CodeActionContext,
-    _token: vscode.CancellationToken
+    _token: vscode.CancellationToken,
   ): Promise<vscode.CodeAction[]> {
     if (!context.only) {
       return [];

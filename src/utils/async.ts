@@ -43,10 +43,10 @@ export class Throttler<T> {
       this.queuedPromiseFactory = promiseFactory;
 
       if (!this.queuedPromise) {
-        let onComplete = () => {
+        const onComplete = () => {
           this.queuedPromise = null;
 
-          let result = this.queue(this.queuedPromiseFactory!);
+          const result = this.queue(this.queuedPromiseFactory!);
           this.queuedPromiseFactory = null;
 
           return result;
@@ -73,7 +73,7 @@ export class Throttler<T> {
         (err: any) => {
           this.activePromise = null;
           reject(err);
-        }
+        },
       );
     });
   }
@@ -119,7 +119,7 @@ export class Delayer<T> {
 
   public trigger(
     task: ITask<T>,
-    delay: number = this.defaultDelay
+    delay: number = this.defaultDelay,
   ): Promise<T> {
     this.task = task;
     this.cancelTimeout();
@@ -131,7 +131,7 @@ export class Delayer<T> {
         this.completionPromise = null;
         this.onResolve = null;
 
-        let result = this.task!();
+        const result = this.task!();
         this.task = null;
 
         return result;
@@ -184,7 +184,7 @@ export class ThrottledDelayer<T> extends Delayer<Promise<T>> {
 
   public override trigger(
     promiseFactory: ITask<Promise<T>>,
-    delay?: number
+    delay?: number,
   ): Promise<Promise<T>> {
     return super.trigger(() => this.throttler.queue(promiseFactory), delay);
   }

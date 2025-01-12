@@ -2,27 +2,35 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    branches:
+      - master
   pull_request:
-    branches: [master]
+    branches:
+      - master
   # This is to catch new releases of VS Code which could cause the extension to break
   schedule:
     - cron: 0 0 * * *
 
+permissions:
+  contents: read # for checkout
+
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        vscode-version: [1.38.1, stable]
+        vscode-version: ["1.66.0", stable]
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Setup Volta, Node and NPM
-        uses: volta-cli/action@v1
+        uses: volta-cli/action@v4
       - run: npm ci
+        env:
+          BINDL_CURRENT_ONLY: "true"
       - name: Test with VS Code ${{ matrix.vscode-version }}
         uses: GabrielBB/xvfb-action@v1
         env:
@@ -30,36 +38,111 @@ jobs:
         with:
           run: npm test
 
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: win32-x64
+            npm_config_arch: x64
+          - os: windows-latest
+            target: win32-arm64
+            npm_config_arch: arm64
+          - os: ubuntu-latest
+            target: linux-x64
+            npm_config_arch: x64
+          - os: ubuntu-latest
+            target: linux-arm64
+            npm_config_arch: arm64
+          - os: ubuntu-latest
+            target: linux-armhf
+            npm_config_arch: arm
+          - os: ubuntu-latest
+            target: alpine-x64
+            npm_config_arch: x64
+          - os: ubuntu-latest
+            target: alpine-arm64
+            npm_config_arch: arm64
+          - os: macos-latest
+            target: darwin-x64
+            npm_config_arch: x64
+          - os: macos-latest
+            target: darwin-arm64
+            npm_config_arch: arm64
+          - os: ubuntu-latest
+            target: universal
+
+    runs-on: ${{ matrix.os }}
+
+    # Even though semantic-release will not publish anything, it still needs to
+    # validate the GITHUB_TOKEN
+    permissions:
+      contents: write # to be able to publish a GitHub release
+      issues: write # to be able to comment on released issues
+      pull-requests: write # to be able to comment on released pull requests
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Volta, Node and NPM
+        uses: volta-cli/action@v4
+      - if: matrix.target != 'universal'
+        name: Install dependencies (with binaries)
+        run: npm ci
+        env:
+          npm_config_arch: ${{ matrix.npm_config_arch }}
+      - if: matrix.target == 'universal'
+        name: Install dependencies (without binaries)
+        run: npm ci
+        env:
+          BINDL_SKIP: "true"
+      - run: npx semantic-release --extends ./package.release.config.mjs
+        env:
+          VSCE_TARGET: ${{ matrix.target }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: "*.vsix"
+      # vsce updates the version in package.json and package-lock.json during
+      # package step, so we need to save them for the publish step
+      - if: matrix.target == 'universal'
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-json
+          path: |
+            package.json
+            package-lock.json
+
   release:
     if: github.event_name != 'schedule'
 
-    needs: test
+    needs: [test, build]
 
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write # to be able to publish a GitHub release
+      issues: write # to be able to comment on released issues
+      pull-requests: write # to be able to comment on released pull requests
+
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_TOKEN_SEMANTIC_RELEASE || github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
       - name: Setup Volta, Node and NPM
-        uses: volta-cli/action@v1
+        uses: volta-cli/action@v4
       - run: npm ci
+        env:
+          BINDL_SKIP: "true"
+      - run: npm audit signatures
       # Only run on push events or pull requests coming from the same repository, except from dependabot
-      - run: npm run release
+      - run: npx semantic-release --extends ./publish.release.config.mjs
         if: github.event_name == 'push' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VSCE_TOKEN: ${{ secrets.VSCE_TOKEN }}
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
-      - if: github.event_name == 'pull_request'
-        name: Create extension vsix for pull request
-        run: |
-          pr_number=$([[ "${GITHUB_REF}" =~ ^refs/pull/(.*)/merge$ ]] && echo ${BASH_REMATCH[1]})
-          npm version prerelease --preid "pr-${pr_number}" --no-git-tag-version
-          npm run package
-      - if: github.event_name == 'pull_request'
-        name: Archive the extension vsix for pull request
-        uses: actions/upload-artifact@v2
-        with:
-          name: extension-vsix
-          path: "*.vsix"
