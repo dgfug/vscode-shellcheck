@@ -1,44 +1,49 @@
 import * as semver from "semver";
 import * as vscode from "vscode";
-import * as execa from "execa";
+import execa from "execa";
+import * as logging from "./logging";
 
-export const BEST_TOOL_VERSION = "0.7.0";
+export const MINIMUM_TOOL_VERSION = "0.7.0";
 
-export function tryPromptForUpdatingTool(version: semver.SemVer | null) {
-  if (!version) {
-    return;
-  }
-
+export function tryPromptForUpdatingTool(version: semver.SemVer) {
   const disableVersionCheckUpdateSetting =
     new DisableVersionCheckUpdateSetting();
   if (!disableVersionCheckUpdateSetting.isDisabled) {
-    if (semver.lt(version, BEST_TOOL_VERSION)) {
+    if (semver.lt(version, MINIMUM_TOOL_VERSION)) {
       promptForUpdatingTool(version.format(), disableVersionCheckUpdateSetting);
     }
   }
 }
 
-export async function getToolVersion(
-  executable: string
-): Promise<semver.SemVer | null> {
-  const { stdout } = execa.sync(executable, ["-V"], { timeout: 5000 });
-
-  const matches = /version: ((?:\d+)\.(?:\d+)(?:\.\d+)*)/.exec(stdout);
-  if (matches && matches[1]) {
-    return semver.parse(matches[1]);
+export function parseToolVersion(s: string): semver.SemVer {
+  const match = s.match(/version: v?((?:\d+)\.(?:\d+)(?:\.\d+)*)/);
+  if (!match || match.length < 2) {
+    throw new Error(`Unexpected response from ShellCheck: ${s}`);
   }
+  const version: semver.SemVer | null = semver.parse(match[1]);
+  if (!version) {
+    throw new Error(`Unable to parse ShellCheck version: ${match[1]}`);
+  }
+  return version;
+}
 
-  return null;
+export async function getToolVersion(
+  executable: string,
+): Promise<semver.SemVer> {
+  logging.debug(`Spawn: ${executable} -V`);
+  const { stdout } = await execa(executable, ["-V"], { timeout: 5000 });
+
+  return parseToolVersion(stdout);
 }
 
 async function promptForUpdatingTool(
   currentVersion: string,
-  disableVersionCheckUpdateSetting: DisableVersionCheckUpdateSetting
+  disableVersionCheckUpdateSetting: DisableVersionCheckUpdateSetting,
 ) {
   const selected = await vscode.window.showInformationMessage(
-    `The vscode-shellcheck extension is better with a newer version of "shellcheck" (You got v${currentVersion}, v${BEST_TOOL_VERSION} or newer is recommended)`,
+    `The ShellCheck extension is better with a newer version of "shellcheck" (you got v${currentVersion}, v${MINIMUM_TOOL_VERSION} or newer is recommended)`,
     "Don't Show Again",
-    "Update"
+    "Update",
   );
   switch (selected) {
     case "Don't Show Again":
@@ -46,7 +51,7 @@ async function promptForUpdatingTool(
       break;
     case "Update":
       vscode.env.openExternal(
-        vscode.Uri.parse("https://github.com/koalaman/shellcheck#installing")
+        vscode.Uri.parse("https://github.com/koalaman/shellcheck#installing"),
       );
       break;
   }

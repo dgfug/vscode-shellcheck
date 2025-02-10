@@ -1,6 +1,6 @@
 import * as semver from "semver";
 import * as vscode from "vscode";
-import { BEST_TOOL_VERSION } from "./utils/tool-check";
+import { MINIMUM_TOOL_VERSION } from "./utils/tool-check";
 
 interface ShellCheckReplacement {
   precedence: number;
@@ -48,7 +48,7 @@ class JsonParserMixin {
 
   protected doParse(
     textDocument: vscode.TextDocument,
-    problems: ShellCheckProblem[]
+    problems: ShellCheckProblem[],
   ): ParseResult[] {
     const result: ParseResult[] = [];
     for (const problem of problems) {
@@ -72,7 +72,7 @@ class JsonParserMixin {
   protected makeCodeAction(
     problem: ShellCheckProblem,
     textDocument: vscode.TextDocument,
-    diagnostic: vscode.Diagnostic
+    diagnostic: vscode.Diagnostic,
   ): vscode.CodeAction | null {
     if (!problem.fix || problem.fix.replacements.length === 0) {
       return null;
@@ -84,17 +84,19 @@ class JsonParserMixin {
     }
 
     const fix = new vscode.CodeAction(
-      `Apply fix for SC${problem.code}`,
-      vscode.CodeActionKind.QuickFix
+      // We use the "ShellCheck:" prefix to filter code actions in Fix All.
+      `ShellCheck: Apply fix for SC${problem.code}`,
+      vscode.CodeActionKind.QuickFix,
     );
     fix.diagnostics = [diagnostic];
+    fix.isPreferred = true;
     fix.edit = new vscode.WorkspaceEdit();
     fix.edit.set(textDocument.uri, edits);
     return fix;
   }
 
   private createTextEdits(
-    replacements: ShellCheckReplacement[]
+    replacements: ShellCheckReplacement[],
   ): vscode.TextEdit[] {
     if (replacements.length === 1) {
       return [this.createTextEdit(replacements[0])];
@@ -110,14 +112,14 @@ class JsonParserMixin {
 
   private createTextEdit(repl: ShellCheckReplacement): vscode.TextEdit {
     const startPos = this.fixPosition(
-      new vscode.Position(repl.line - 1, repl.column - 1)
+      new vscode.Position(repl.line - 1, repl.column - 1),
     );
     const endPos = this.fixPosition(
-      new vscode.Position(repl.endLine - 1, repl.endColumn - 1)
+      new vscode.Position(repl.endLine - 1, repl.endColumn - 1),
     );
     return new vscode.TextEdit(
       new vscode.Range(startPos, endPos),
-      repl.replacement
+      repl.replacement,
     );
   }
 
@@ -140,7 +142,12 @@ class JsonParserMixin {
     const severity = convertSeverity(problem.level);
     const diagnostic = new vscode.Diagnostic(range, problem.message, severity);
     diagnostic.source = "shellcheck";
-    diagnostic.code = `SC${problem.code}`;
+    diagnostic.code = {
+      value: `SC${problem.code}`,
+      target: vscode.Uri.parse(
+        `https://www.shellcheck.net/wiki/SC${problem.code}`,
+      ),
+    };
     diagnostic.tags = scCodeToDiagnosticTags(problem.code);
     return diagnostic;
   }
@@ -156,7 +163,7 @@ class JsonParser extends JsonParserMixin implements Parser {
 
   constructor(
     public readonly textDocument: vscode.TextDocument,
-    options?: ParserOptions
+    options?: ParserOptions,
   ) {
     super(options);
   }
@@ -170,7 +177,7 @@ class JsonParser extends JsonParserMixin implements Parser {
     // Since json format treats tabs as **8** characters, we need to offset it.
     let charPos = pos.character;
     const s = this.textDocument.getText(
-      new vscode.Range(pos.with({ character: 0 }), pos)
+      new vscode.Range(pos.with({ character: 0 }), pos),
     );
     for (const ch of s) {
       if (ch === "\t") {
@@ -187,7 +194,7 @@ class Json1Parser extends JsonParserMixin implements Parser {
 
   constructor(
     public readonly textDocument: vscode.TextDocument,
-    options?: ParserOptions
+    options?: ParserOptions,
   ) {
     super(options);
   }
@@ -224,19 +231,19 @@ const codeToTags: { [name: number]: vscode.DiagnosticTag[] } = {
 };
 
 function scCodeToDiagnosticTags(
-  code: number
+  code: number,
 ): vscode.DiagnosticTag[] | undefined {
   return codeToTags[code];
 }
 
 export function createParser(
   textDocument: vscode.TextDocument,
-  options?: ParserOptions
+  options?: ParserOptions,
 ): Parser {
   if (
     options &&
     options.toolVersion &&
-    semver.gte(options.toolVersion, BEST_TOOL_VERSION)
+    semver.gte(options.toolVersion, MINIMUM_TOOL_VERSION)
   ) {
     return new Json1Parser(textDocument, options);
   }
